@@ -25,6 +25,9 @@ func handleMessage(ctx context.Context, evt *events.Message, chatStorageRepo dom
 		evt.Message,
 	)
 
+	// Write structured JSON log for analytics
+	go LogIncomingMessage(evt, client)
+
 	if err := chatStorageRepo.CreateMessage(ctx, evt); err != nil {
 		// Log storage errors to avoid silent failures that could lead to data loss
 		log.Errorf("Failed to store incoming message %s: %v", evt.Info.ID, err)

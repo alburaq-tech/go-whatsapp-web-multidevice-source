@@ -8,6 +8,7 @@ services:
     volumes:
       - ./src:/app/src
       - go_cache:/root/go
+      - logs_data:/app/logs
     env_file:
       - src/.env
     restart: unless-stopped
@@ -17,5 +18,18 @@ services:
         max-size: "200k"
         max-file: "10"
 
+  vector_agent:
+    image: timberio/vector:0.45.0-alpine
+    volumes:
+      - ./vector/agent.yaml:/etc/vector/vector.yaml:ro
+      - logs_data:/app/logs
+    environment:
+      VECTOR_AGGREGATOR_HOST: ${VECTOR_AGGREGATOR_HOST:-host.docker.internal:8686}
+    entrypoint: ["sh", "-c", "mkdir -p /tmp/vector-agent && vector --config /etc/vector/vector.yaml"]
+    restart: unless-stopped
+    depends_on:
+      - whatsapp_go
+
 volumes:
   go_cache:
+  logs_data:
