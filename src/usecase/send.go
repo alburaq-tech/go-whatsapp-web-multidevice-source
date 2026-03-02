@@ -63,6 +63,13 @@ func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeo
 		senderJID = client.Store.ID.String()
 	}
 
+	// Write structured JSON log for analytics
+	senderJIDNonAD := ""
+	if client.Store.ID != nil {
+		senderJIDNonAD = client.Store.ID.ToNonAD().String()
+	}
+	go whatsapp.LogOutgoingMessage(ts.ID, senderJIDNonAD, recipient, msg, content, ts.Timestamp)
+
 	// Store message asynchronously with timeout
 	// Use a goroutine to avoid blocking the send operation
 	go func() {
