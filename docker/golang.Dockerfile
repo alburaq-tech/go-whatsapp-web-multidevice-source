@@ -15,7 +15,8 @@ RUN go build -a -ldflags="-w -s" -o /app/whatsapp
 ## STEP 2 build a smaller image
 #############################
 FROM alpine:3.23
-RUN apk add --no-cache ffmpeg libwebp-tools tzdata
+# apk upgrade: take patched Alpine packages (brotli-libs >= 1.2.1-r0) even when older layers are cached
+RUN apk upgrade --no-cache && apk add --no-cache ffmpeg libwebp-tools tzdata
 ENV TZ=UTC
 WORKDIR /app
 # Copy compiled from builder.
