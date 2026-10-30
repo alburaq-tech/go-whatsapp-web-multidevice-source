@@ -425,8 +425,8 @@ func initApp() {
 		}
 
 		if err != nil {
+			// Keep booting with the static APP_BASIC_AUTH: returning here left every usecase nil (nil-pointer panic, crash-loop)
 			logrus.Errorf("Failed to connect to basic auth DB: %v", err)
-			return
 		}
 
 		if err == nil {
