@@ -10,7 +10,7 @@ services:
       dockerfile: ./docker/golang.Dockerfile
     restart: "on-failure"
     ports:
-      - "3000:3000"
+      - "100.101.113.22:3000:3000"
     volumes:
       - logs_data:/app/logs
       - storages_data:/app/storages
