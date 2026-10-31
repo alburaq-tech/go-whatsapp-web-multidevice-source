@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
@@ -77,22 +76,63 @@ func forwardGroupInfoToWebhook(ctx context.Context, evt *events.GroupInfo, devic
 		}
 	}
 
+	if evt.Name != nil {
+		payload := createGroupNamePayload(ctx, evt, deviceID, client)
+
+		if err := forwardPayloadToConfiguredWebhooks(ctx, payload, "group.info"); err != nil {
+			logrus.Warnf("Failed to forward group name change to webhook: %v", err)
+		}
+	}
+
 	return nil
+}
+
+// createGroupNamePayload creates a group.info webhook payload for a group name (subject) change
+func createGroupNamePayload(ctx context.Context, evt *events.GroupInfo, deviceID string, client *whatsmeow.Client) map[string]any {
+	payload := map[string]any{
+		"chat_id": evt.JID.ToNonAD().String(),
+		"name":    evt.Name.Name,
+	}
+	if setBy := groupNameSetBy(ctx, evt.Name, client); setBy != "" {
+		payload["name_set_by"] = setBy
+	}
+
+	body := map[string]any{
+		"event":     "group.info",
+		"payload":   payload,
+		"timestamp": evt.Timestamp.Format(time.RFC3339),
+	}
+	if deviceID != "" {
+		body["device_id"] = deviceID
+	}
+
+	return body
+}
+
+// groupNameSetBy returns the JID of the user who set the group name, preferring the phone
+// number JID that WhatsApp sends next to a LID. Returns "" when WhatsApp did not say who.
+func groupNameSetBy(ctx context.Context, name *types.GroupName, client *whatsmeow.Client) string {
+	if !name.NameSetByPN.IsEmpty() {
+		return name.NameSetByPN.ToNonAD().String()
+	}
+	if name.NameSetBy.IsEmpty() {
+		return ""
+	}
+	return NormalizeJIDFromLID(ctx, name.NameSetBy, client).ToNonAD().String()
 }
 
 // handleJoinedGroup handles the event when the connected device is added to a new group
 func handleJoinedGroup(ctx context.Context, evt *events.JoinedGroup, deviceID string, client *whatsmeow.Client) {
 	log.Infof("Joined group %s (reason: %s, type: %s)", evt.JID, evt.Reason, evt.Type)
 
-	if len(config.WhatsappWebhook) > 0 {
-		go func(e *events.JoinedGroup, c *whatsmeow.Client) {
-			webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := forwardJoinedGroupToWebhook(webhookCtx, e, deviceID, c); err != nil {
-				logrus.Errorf("Failed to forward joined group event to webhook: %v", err)
-			}
-		}(evt, client)
-	}
+	// Forward joined group event to webhook
+	go func(e *events.JoinedGroup, c *whatsmeow.Client) {
+		webhookCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		if err := forwardJoinedGroupToWebhook(webhookCtx, e, deviceID, c); err != nil {
+			logrus.Errorf("Failed to forward joined group event to webhook: %v", err)
+		}
+	}(evt, client)
 }
 
 // forwardJoinedGroupToWebhook forwards the JoinedGroup event to configured webhooks

@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -11,7 +12,12 @@ import (
 type IChatStorageRepository interface {
 	// Chat operations
 	CreateMessage(ctx context.Context, evt *events.Message) error
+	CreateReaction(ctx context.Context, evt *events.Message) error
+	// CreateIncomingCallRecord persists an incoming call as a synthetic message (media_type "call") for chat history.
+	CreateIncomingCallRecord(ctx context.Context, evt *events.CallOffer, autoRejected bool) error
 	StoreChat(chat *Chat) error
+	// GetChat matches a JID on any device. Not for user-facing flows: use
+	// GetChatByDevice.
 	GetChat(jid string) (*Chat, error)
 	GetChatByDevice(deviceID, jid string) (*Chat, error)
 	GetChats(filter *ChatFilter) ([]*Chat, error)
@@ -20,19 +26,119 @@ type IChatStorageRepository interface {
 
 	// Message operations
 	StoreMessage(message *Message) error
+	StoreMessageEdit(edit *MessageEdit) error
 	StoreMessagesBatch(messages []*Message) error
-	GetMessageByID(id string) (*Message, error) // New method for efficient ID-only search
+	// GetMessageByID matches an ID on any device and returns an arbitrary one of
+	// the rows. Each device stores its own copy (with its own "from me" flag and
+	// media keys), so user-facing flows must use the device-scoped lookups below.
+	GetMessageByID(id string) (*Message, error)
+	GetMessageByIDAndDevice(deviceID, id string) (*Message, error)              // Device-scoped ID lookup for device-isolated flows
+	GetMessageByIDChatAndDevice(deviceID, chatJID, id string) (*Message, error) // Full storage identity lookup for chat-scoped flows
+	GetMessageEdits(originalMessageID, deviceID string) ([]*MessageEdit, error)
 	GetMessages(filter *MessageFilter) ([]*Message, error)
+	// GetOldestMessageByDevice returns the earliest stored message for a chat,
+	// used to anchor on-demand history sync requests. Returns nil (no error)
+	// when the chat has no stored messages.
+	GetOldestMessageByDevice(deviceID, chatJID string) (*Message, error)
 	SearchMessages(deviceID, chatJID, searchText string, limit int) ([]*Message, error) // Database-level search with device isolation
 	DeleteMessage(id, chatJID string) error
 	DeleteMessageByDevice(deviceID, id, chatJID string) error
-	StoreSentMessageWithContext(ctx context.Context, messageID string, senderJID string, recipientJID string, content string, timestamp time.Time) error
+	StoreSentMessageWithContext(ctx context.Context, messageID string, senderJID string, recipientJID string, content string, timestamp time.Time, msg *waE2E.Message) error
+
+	// Poll definition operations
+	UpsertPollDefinition(definition *PollDefinition) error
+	GetPollDefinition(deviceID, chatJID, pollMessageID string) (*PollDefinition, error)
+	GetPollDefinitionByIDAndDevice(deviceID, pollMessageID string) (*PollDefinition, error)
+	AppendPollOption(deviceID, chatJID, pollMessageID string, option PollOption) error
+
+	// Chatwoot correlation operations
+	UpsertChatwootMessageLink(link *ChatwootMessageLink) error
+	GetChatwootMessageLinkByWhatsAppID(deviceID, waMessageID string) (*ChatwootMessageLink, error)
+	GetChatwootMessageLinkByChatwootID(deviceID string, chatwootMessageID int) (*ChatwootMessageLink, error)
+	// GetChatwootMessageLinkForReply returns the link of a quoted Chatwoot
+	// message within the filter's scope, or nil when there is none.
+	GetChatwootMessageLinkForReply(filter ChatwootReplyLinkFilter) (*ChatwootMessageLink, error)
+	// GetLatestChatwootMessageLinkByConversation resolves a conversation to its
+	// most recent link. Conversation ids are numbered per Chatwoot account, so the
+	// lookup is account-scoped. allowLegacyZero additionally matches rows whose
+	// account id is 0 (pre-migration legacy links) — pass true only in legacy
+	// single-account mode; in per-device mode it must be false, or a colliding
+	// conversation id from another account could match a legacy row and misroute.
+	// configID, when non-zero, further restricts the match to links written under
+	// that device config: separate Chatwoot servers can collide on
+	// (conversation_id, account_id), so per-device (forced-route) callers must
+	// scope by their own config. configID 0 does not mean "any server". Each
+	// chatwoot_device_configs row is one server (URL + account + inbox). If the
+	// matching links span more than one non-zero config, the lookup returns nil
+	// so the shared webhook cannot pick the newest row from the wrong server.
+	// Legacy config-id 0 rows are used only when they are the only matches.
+	GetLatestChatwootMessageLinkByConversation(conversationID, accountID int, allowLegacyZero bool, configID int64) (*ChatwootMessageLink, error)
+	GetLatestUnreadChatwootMessageLinkByChat(deviceID, waChatJID string) (*ChatwootMessageLink, error)
+	CountChatwootMessageLinksByConfig(configID int64) (int, error)
+	// DeleteChatwootMessageLinksByConfig removes every link written under a
+	// device config. Called when the config is deleted so stale links cannot
+	// hijack reverse-route lookups after a delete-and-recreate rebind.
+	DeleteChatwootMessageLinksByConfig(configID int64) error
+	// BackfillChatwootMessageLinkAccount stamps the given account id onto legacy
+	// links whose account id is still 0, so they resolve under exact-account
+	// scoping instead of relying on the legacy-zero wildcard. Idempotent.
+	BackfillChatwootMessageLinkAccount(accountID int) (int64, error)
+	EnqueueChatwootForwardEvent(event *ChatwootForwardEvent) error
+	ListDueChatwootForwardEvents(now time.Time, limit int) ([]*ChatwootForwardEvent, error)
+	MarkChatwootForwardEventFailed(id int64, lastError string, nextAttemptAt time.Time) error
+	MarkChatwootForwardEventDone(id int64) error
+
+	// Scheduled send operations.
+	CreateScheduledSend(job *ScheduledSend) error
+	ListScheduledSends(filter ScheduledSendFilter) ([]*ScheduledSend, error)
+	CountScheduledSends(filter ScheduledSendFilter) (int, error)
+	GetScheduledSend(deviceID, id string) (*ScheduledSend, error)
+	// ClaimNextScheduledSend atomically leases the earliest due active job, or
+	// returns nil when nothing is due.
+	ClaimNextScheduledSend(now, leaseUntil time.Time, leaseToken string) (*ScheduledSend, error)
+	// ClaimExpiredScheduledSend atomically takes over one expired lease and returns
+	// its current occurrence state, fencing writes from the previous worker.
+	ClaimExpiredScheduledSend(now, leaseUntil time.Time, leaseToken string) (*ScheduledSend, error)
+	// ListScheduledSendIDs returns every job that may still need its media.
+	ListScheduledSendIDs() ([]string, error)
+	// SetScheduledSendPendingAttempt atomically records the identity and poll
+	// secret before dispatch, or validates the existing pair. It reports false
+	// when the lease expired, ownership changed, or the pair differs.
+	SetScheduledSendPendingAttempt(id, leaseToken, messageID string, pollSecret []byte, now time.Time) (bool, error)
+	// ClearScheduledSendPendingMessageID forgets the message id of a paused
+	// job's occurrence and its poll secret when moving to another occurrence.
+	ClearScheduledSendPendingMessageID(deviceID, id string) error
+	// RetryScheduledSend returns a claimed job to the queue. attempts 0 means
+	// nothing of the occurrence that follows has been sent (a new occurrence,
+	// or one that never got to send): its pending message id is cleared.
+	RetryScheduledSend(id, leaseToken, lastError string, attempts int, nextRunAt time.Time) error
+	CompleteScheduledSend(id, leaseToken, status, lastMessageID string, occurrenceCount int, nextRunAt *time.Time) error
+	FailScheduledSend(id, leaseToken, lastError string) error
+	// SetScheduledSendStatus moves a job to status only from one of the given
+	// statuses, and reports whether a row changed.
+	SetScheduledSendStatus(deviceID, id string, from []string, status string, nextRunAt *time.Time) (bool, error)
+
+	// Chatwoot per-device configuration (multi-device / multi-inbox routing)
+	SaveChatwootDeviceConfig(cfg *ChatwootDeviceConfig) error
+	// UpdateChatwootDeviceConfigJID stamps the device's current WhatsApp JID
+	// onto its config row (no-op without a row or when already current).
+	// Reports whether the stored JID changed. Called on connect so a config
+	// created before pairing — or stale after a re-pair — resolves on the
+	// JID-keyed forward path.
+	UpdateChatwootDeviceConfigJID(deviceID, deviceJID string) (bool, error)
+	GetChatwootDeviceConfig(deviceID string) (*ChatwootDeviceConfig, error)
+	GetChatwootDeviceConfigByIdentifier(identifier string) (*ChatwootDeviceConfig, error)
+	GetChatwootDeviceConfigByInbox(accountID, inboxID int) (*ChatwootDeviceConfig, error)
+	ListChatwootDeviceConfigs() ([]*ChatwootDeviceConfig, error)
+	DeleteChatwootDeviceConfig(deviceID string) error
+	CountChatwootDeviceConfigs() (int, error)
 
 	// Statistics
 	GetChatMessageCount(chatJID string) (int64, error)
 	GetChatMessageCountByDevice(deviceID, chatJID string) (int64, error)
 	GetTotalMessageCount() (int64, error)
 	GetTotalChatCount() (int64, error)
+	GetFilteredChatCount(filter *ChatFilter) (int64, error)
 	GetChatNameWithPushName(jid types.JID, chatJID string, senderUser string, pushName string) string
 	GetChatNameWithPushNameByDevice(deviceID string, jid types.JID, chatJID string, senderUser string, pushName string) string
 	GetStorageStatistics() (chatCount int64, messageCount int64, err error)
@@ -46,7 +152,19 @@ type IChatStorageRepository interface {
 	SaveDeviceRecord(record *DeviceRecord) error
 	ListDeviceRecords() ([]*DeviceRecord, error)
 	GetDeviceRecord(deviceID string) (*DeviceRecord, error)
+	// GetDeviceRecordByJID fetches a device record by its JID. A full AD JID resolves
+	// the exact slot; a bare-number JID resolves only while unambiguous — when several
+	// slots share the number it returns nil rather than an arbitrary sibling's record.
+	GetDeviceRecordByJID(jid string) (*DeviceRecord, error)
 	DeleteDeviceRecord(deviceID string) error
+	// SetDeviceWebhookURL sets the webhook URL for a device.
+	SetDeviceWebhookURL(deviceID string, webhookURL *string) error
+	// GetDeviceWebhookURL retrieves the webhook URL for a device.
+	GetDeviceWebhookURL(deviceID string) (*string, error)
+	// SetDeviceWebhookConfig sets the full webhook configuration for a device.
+	SetDeviceWebhookConfig(deviceID string, config *DeviceWebhookConfig) error
+	// GetDeviceWebhookConfig retrieves the full webhook configuration for a device.
+	GetDeviceWebhookConfig(ctx context.Context, deviceID string) (*DeviceWebhookConfig, error)
 
 	// Schema operations
 	InitializeSchema() error

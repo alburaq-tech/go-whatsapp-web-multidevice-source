@@ -6,25 +6,48 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"io"
+	"sync"
 	"time"
 
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainUser "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/user"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/validations"
 	"github.com/disintegration/imaging"
+	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/appstate"
 	"go.mau.fi/whatsmeow/types"
 )
 
 type serviceUser struct {
-	// Remove the WaCli field - we'll use the global client instead
+	chatStorageRepo         domainChatStorage.IChatStorageRepository
+	validateJIDFn           func(client *whatsmeow.Client, phone string) (types.JID, error)
+	getProfilePictureInfoFn func(ctx context.Context, client *whatsmeow.Client, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error)
 }
 
-func NewUserService() domainUser.IUserUsecase {
-	return &serviceUser{}
+func NewUserService(chatStorageRepo domainChatStorage.IChatStorageRepository) domainUser.IUserUsecase {
+	return &serviceUser{
+		chatStorageRepo: chatStorageRepo,
+	}
+}
+
+func (service serviceUser) validateJID(client *whatsmeow.Client, phone string) (types.JID, error) {
+	if service.validateJIDFn != nil {
+		return service.validateJIDFn(client, phone)
+	}
+	return utils.ValidateJidWithLogin(client, phone)
+}
+
+func (service serviceUser) getProfilePictureInfo(ctx context.Context, client *whatsmeow.Client, jid types.JID, params *whatsmeow.GetProfilePictureParams) (*types.ProfilePictureInfo, error) {
+	if service.getProfilePictureInfoFn != nil {
+		return service.getProfilePictureInfoFn(ctx, client, jid, params)
+	}
+	return client.GetProfilePictureInfo(ctx, jid, params)
 }
 
 func (service serviceUser) Info(ctx context.Context, request domainUser.InfoRequest) (response domainUser.InfoResponse, err error) {
@@ -67,7 +90,19 @@ func (service serviceUser) Info(ctx context.Context, request domainUser.InfoRequ
 		return response, err
 	}
 
-	for _, userInfo := range resp {
+	// Get device ID for scoped storage lookup
+	deviceID := ""
+	if inst, ok := whatsapp.DeviceFromContext(ctx); ok && inst != nil {
+		deviceID = inst.JID()
+		if deviceID == "" {
+			deviceID = inst.ID()
+		}
+	}
+	if deviceID == "" && client.Store != nil && client.Store.ID != nil {
+		deviceID = client.Store.ID.ToNonAD().String()
+	}
+
+	for jid, userInfo := range resp {
 		var device []domainUser.InfoResponseDataDevice
 		for _, j := range userInfo.Devices {
 			device = append(device, domainUser.InfoResponseDataDevice{
@@ -84,6 +119,16 @@ func (service serviceUser) Info(ctx context.Context, request domainUser.InfoRequ
 			PictureID: userInfo.PictureID,
 			Devices:   device,
 		}
+
+		// Try to get name from storage if available (device-scoped to prevent data leak)
+		if service.chatStorageRepo != nil && deviceID != "" {
+			if chat, err := service.chatStorageRepo.GetChatByDevice(deviceID, jid.String()); err == nil && chat != nil {
+				data.Name = chat.Name
+			} else if err != nil {
+				logrus.Debugf("Could not fetch chat name from storage for %s: %v", jid.String(), err)
+			}
+		}
+
 		if userInfo.VerifiedName != nil {
 			data.VerifiedName = fmt.Sprintf("%v", *userInfo.VerifiedName)
 		}
@@ -104,7 +149,7 @@ func (service serviceUser) Avatar(ctx context.Context, request domainUser.Avatar
 		return response, err
 	}
 
-	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
+	dataWaRecipient, err := service.validateJID(client, request.Phone)
 	if err != nil {
 		return response, err
 	}
@@ -119,7 +164,7 @@ func (service serviceUser) Avatar(ctx context.Context, request domainUser.Avatar
 	avatarCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	pic, err := client.GetProfilePictureInfo(avatarCtx, dataWaRecipient, &whatsmeow.GetProfilePictureParams{
+	pic, err := service.getProfilePictureInfo(avatarCtx, client, dataWaRecipient, &whatsmeow.GetProfilePictureParams{
 		Preview:     request.IsPreview,
 		IsCommunity: isCommunity,
 	})
@@ -132,21 +177,40 @@ func (service serviceUser) Avatar(ctx context.Context, request domainUser.Avatar
 			avatarCtx2, cancel2 := context.WithTimeout(ctx, 5*time.Second)
 			defer cancel2()
 
-			pic, err = client.GetProfilePictureInfo(avatarCtx2, dataWaRecipient, &whatsmeow.GetProfilePictureParams{
+			fallbackPic, fallbackErr := service.getProfilePictureInfo(avatarCtx2, client, dataWaRecipient, &whatsmeow.GetProfilePictureParams{
 				Preview:     request.IsPreview,
 				IsCommunity: false,
 			})
-			if err != nil {
+			if fallbackErr != nil {
 				if avatarCtx2.Err() == context.DeadlineExceeded {
 					return response, pkgError.ContextError("Error timeout get avatar!")
 				}
-				return response, err
+				// In whatsmeow, GetProfilePictureInfo notes that community photos should use
+				// IsCommunity: true, and that querying them with IsCommunity: false may return
+				// 401 (ErrProfilePictureUnauthorized). Passing that fallback error directly
+				// through avatarError would expose false-positive 403 AVATAR_HIDDEN signals.
+				//
+				// To keep AVATAR_HIDDEN and AVATAR_NOT_SET authoritative for caching clients,
+				// only classify when both attempts agree on the sentinel. Otherwise, return
+				// the fallback error unclassified.
+				if errors.Is(err, whatsmeow.ErrProfilePictureNotSet) && errors.Is(fallbackErr, whatsmeow.ErrProfilePictureNotSet) {
+					return response, avatarError(fallbackErr)
+				}
+				if errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized) && errors.Is(fallbackErr, whatsmeow.ErrProfilePictureUnauthorized) {
+					return response, avatarError(fallbackErr)
+				}
+				return response, fallbackErr
 			}
+			pic = fallbackPic
 		} else {
-			return response, err
+			return response, avatarError(err)
 		}
 	}
 
+	// A nil picture without an error means "unchanged" (status 304 for a known
+	// ExistingID), not "no picture": that one arrives as ErrProfilePictureNotSet
+	// and is typed by avatarError. Keep it out of AvatarNotSetError so that
+	// caching clients never drop a valid picture.
 	if pic == nil {
 		return response, errors.New("no avatar found")
 	}
@@ -196,7 +260,51 @@ func (service serviceUser) MyListNewsletter(ctx context.Context) (response domai
 		return
 	}
 
+	// GetSubscribedNewsletters may return incomplete metadata from WhatsApp,
+	// especially subscribers_count. Enrich entries that are missing the count via
+	// GetNewsletterInfo with bounded parallelism so we don't fan out unboundedly
+	// to the WhatsApp socket, and a per-call timeout so one slow newsletter
+	// cannot stall the whole request.
+	const (
+		newsletterDetailParallelism = 5
+		newsletterDetailTimeout     = 5 * time.Second
+	)
+
+	sem := make(chan struct{}, newsletterDetailParallelism)
+	var wg sync.WaitGroup
 	for _, data := range datas {
+		if data == nil {
+			continue
+		}
+		// Skip the detail fetch when the base response already populated the count.
+		if data.ThreadMeta.SubscriberCount > 0 {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(d *types.NewsletterMetadata) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			detailCtx, cancel := context.WithTimeout(ctx, newsletterDetailTimeout)
+			defer cancel()
+
+			detail, detailErr := client.GetNewsletterInfo(detailCtx, d.ID)
+			if detailErr != nil {
+				logrus.Debugf("Could not fetch newsletter detail for %s: %v", d.ID.String(), detailErr)
+				return
+			}
+			if detail != nil {
+				d.ThreadMeta.SubscriberCount = detail.ThreadMeta.SubscriberCount
+			}
+		}(data)
+	}
+	wg.Wait()
+
+	for _, data := range datas {
+		if data == nil {
+			continue
+		}
 		response.Data = append(response.Data, *data)
 	}
 	return response, nil
@@ -236,7 +344,7 @@ func (service serviceUser) MyListContacts(ctx context.Context) (response domainU
 	for jid, contact := range contacts {
 		response.Data = append(response.Data, domainUser.MyListContactsResponseData{
 			JID:  jid,
-			Name: contact.FullName,
+			Name: contactInfoDisplayName(contact),
 		})
 	}
 
@@ -256,8 +364,8 @@ func (service serviceUser) ChangeAvatar(ctx context.Context, request domainUser.
 	}
 	defer file.Close()
 
-	// Read original image
-	srcImage, err := imaging.Decode(file)
+	// Read original image. Dimensions are checked before the raster is allocated.
+	srcImage, err := decodeAvatarImage(file)
 	if err != nil {
 		return fmt.Errorf("failed to decode image: %v", err)
 	}
@@ -301,6 +409,13 @@ func (service serviceUser) ChangeAvatar(ctx context.Context, request domainUser.
 	return nil
 }
 
+// decodeAvatarImage decodes an uploaded avatar only after its header dimensions
+// pass the shared pixel budget.
+func decodeAvatarImage(r io.Reader) (image.Image, error) {
+	img, _, err := utils.DecodeImageWithinBudget(r)
+	return img, err
+}
+
 func (service serviceUser) ChangePushName(ctx context.Context, request domainUser.ChangePushNameRequest) (err error) {
 	client := whatsapp.ClientFromContext(ctx)
 	if client == nil {
@@ -325,6 +440,52 @@ func (service serviceUser) IsOnWhatsApp(ctx context.Context, request domainUser.
 	utils.SanitizePhone(&request.Phone)
 
 	response.IsOnWhatsApp = utils.IsOnWhatsapp(client, request.Phone)
+
+	return response, nil
+}
+
+func (service serviceUser) SubscribePresence(ctx context.Context, request domainUser.SubscribePresenceRequest) (response domainUser.SubscribePresenceResponse, err error) {
+	if err = validations.ValidateSubscribePresence(ctx, request); err != nil {
+		return response, err
+	}
+
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+	utils.MustLogin(client)
+
+	utils.SanitizePhone(&request.Phone)
+
+	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.Phone)
+	if err != nil {
+		return response, err
+	}
+
+	// Presence subscription is only valid for individual users; reject group /
+	// newsletter JIDs (e.g. caused by over-length phone inputs) instead of
+	// returning a false success.
+	if dataWaRecipient.Server != types.DefaultUserServer {
+		return response, pkgError.InvalidJID(fmt.Sprintf(
+			"presence subscription requires a user phone number, got non-user JID %s",
+			dataWaRecipient.ToNonAD().String()))
+	}
+
+	if err = client.SubscribePresence(ctx, dataWaRecipient); err != nil {
+		return response, err
+	}
+
+	// whatsmeow requires this client to be marked as available (online) to
+	// receive presence updates for other users. Do not override the operator's
+	// configured presence-on-connect value — surface the requirement instead.
+	if config.WhatsappPresenceOnConnect != "available" {
+		logrus.Warnf("presence subscription: client presence-on-connect is %q; "+
+			"contact presence updates require WHATSAPP_PRESENCE_ON_CONNECT=available "+
+			"(note: marking the device available suppresses phone notifications)", config.WhatsappPresenceOnConnect)
+	}
+
+	response.Subscribed = true
+	response.JID = dataWaRecipient.ToNonAD().String()
 
 	return response, nil
 }
@@ -384,4 +545,20 @@ func (service serviceUser) BusinessProfile(ctx context.Context, request domainUs
 	}
 
 	return response, nil
+}
+
+// avatarError types the two whatsmeow outcomes that clients must tell apart.
+// Both used to surface as the same 500, and a client that cached avatars could
+// only guess from the message text whether the picture was gone or merely
+// hidden from this account. The messages are kept verbatim so that clients
+// matching on text keep working.
+func avatarError(err error) error {
+	switch {
+	case errors.Is(err, whatsmeow.ErrProfilePictureNotSet):
+		return pkgError.AvatarNotSetError(err.Error())
+	case errors.Is(err, whatsmeow.ErrProfilePictureUnauthorized):
+		return pkgError.AvatarHiddenError(err.Error())
+	default:
+		return err
+	}
 }

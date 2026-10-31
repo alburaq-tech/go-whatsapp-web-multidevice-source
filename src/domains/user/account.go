@@ -19,6 +19,7 @@ type InfoResponseDataDevice struct {
 }
 
 type InfoResponseData struct {
+	Name         string                   `json:"name"`
 	VerifiedName string                   `json:"verified_name"`
 	Status       string                   `json:"status"`
 	PictureID    string                   `json:"picture_id"`
@@ -82,6 +83,15 @@ type CheckRequest struct {
 
 type CheckResponse struct {
 	IsOnWhatsApp bool `json:"is_on_whatsapp"`
+}
+
+type SubscribePresenceRequest struct {
+	Phone string `json:"phone" query:"phone"`
+}
+
+type SubscribePresenceResponse struct {
+	Subscribed bool   `json:"subscribed"`
+	JID        string `json:"jid"`
 }
 
 type BusinessProfileRequest struct {
