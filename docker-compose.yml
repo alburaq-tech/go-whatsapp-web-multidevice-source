@@ -10,7 +10,7 @@ services:
       dockerfile: ./docker/golang.Dockerfile
     restart: unless-stopped
     ports:
-      - "100.101.113.22:3000:3000"
+      - "${GOWA_BIND_IP:-127.0.0.1}:3000:3000"
     healthcheck:
       test: ["CMD-SHELL", "wget -S -O /dev/null http://127.0.0.1:3000/ 2>&1 | grep -qE 'HTTP/1\\.[01] (200|401)'"]
       interval: 30s
