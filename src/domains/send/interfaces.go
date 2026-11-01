@@ -20,6 +20,7 @@ type IMediaSender interface {
 
 // IInteractionSender handles interaction message sending operations
 type IInteractionSender interface {
+	SendInteractive(ctx context.Context, request InteractiveRequest) (response GenericResponse, err error)
 	SendContact(ctx context.Context, request ContactRequest) (response GenericResponse, err error)
 	SendLink(ctx context.Context, request LinkRequest) (response GenericResponse, err error)
 	SendLocation(ctx context.Context, request LocationRequest) (response GenericResponse, err error)
@@ -32,10 +33,16 @@ type IPresenceSender interface {
 	SendChatPresence(ctx context.Context, request ChatPresenceRequest) (response GenericResponse, err error)
 }
 
+// IForwardSender handles forward-by-message-id operations
+type IForwardSender interface {
+	SendForward(ctx context.Context, request ForwardRequest) (response GenericResponse, err error)
+}
+
 // ISendUsecase combines all sender interfaces for backward compatibility
 type ISendUsecase interface {
 	ITextSender
 	IMediaSender
 	IInteractionSender
 	IPresenceSender
+	IForwardSender
 }

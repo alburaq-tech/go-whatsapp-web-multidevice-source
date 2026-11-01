@@ -122,13 +122,13 @@ func TestValidateReactMessage(t *testing.T) {
 			err: pkgError.ValidationError("message_id: cannot be blank."),
 		},
 		{
-			name: "should error with empty emoji",
+			name: "should success with empty emoji (unreact)",
 			args: args{request: domainMessage.ReactionRequest{
 				Phone:     "6281234567890@s.whatsapp.net",
 				MessageID: "3EB0789ABC123456",
 				Emoji:     "",
 			}},
-			err: pkgError.ValidationError("emoji: cannot be blank."),
+			err: nil,
 		},
 		{
 			name: "should error with all empty fields",
@@ -137,7 +137,7 @@ func TestValidateReactMessage(t *testing.T) {
 				MessageID: "",
 				Emoji:     "",
 			}},
-			err: pkgError.ValidationError("emoji: cannot be blank; message_id: cannot be blank; phone: cannot be blank."),
+			err: pkgError.ValidationError("message_id: cannot be blank; phone: cannot be blank."),
 		},
 	}
 
@@ -150,7 +150,6 @@ func TestValidateReactMessage(t *testing.T) {
 				assert.Error(t, err)
 				assert.Contains(t, err.Error(), "phone: cannot be blank")
 				assert.Contains(t, err.Error(), "message_id: cannot be blank")
-				assert.Contains(t, err.Error(), "emoji: cannot be blank")
 			} else {
 				assert.Equal(t, tt.err, err)
 			}
@@ -242,8 +241,7 @@ func TestValidateStarMessage(t *testing.T) {
 				MessageID: "3EB0789ABC123456",
 				IsStarred: false,
 			}},
-			// Note: validation.Required treats false as blank for boolean fields
-			err: pkgError.ValidationError("is_starred: cannot be blank."),
+			err: nil,
 		},
 		{
 			name: "should error with empty phone",
@@ -270,8 +268,7 @@ func TestValidateStarMessage(t *testing.T) {
 				MessageID: "",
 				IsStarred: false,
 			}},
-			// All three fields will fail validation when IsStarred is false
-			err: pkgError.ValidationError("is_starred: cannot be blank; message_id: cannot be blank; phone: cannot be blank."),
+			err: pkgError.ValidationError("message_id: cannot be blank; phone: cannot be blank."),
 		},
 	}
 
@@ -280,11 +277,6 @@ func TestValidateStarMessage(t *testing.T) {
 			err := ValidateStarMessage(context.Background(), tt.args.request)
 			if tt.err == nil {
 				assert.NoError(t, err)
-			} else if tt.name == "should error with empty phone and message id" {
-				assert.Error(t, err)
-				assert.Contains(t, err.Error(), "is_starred: cannot be blank")
-				assert.Contains(t, err.Error(), "message_id: cannot be blank")
-				assert.Contains(t, err.Error(), "phone: cannot be blank")
 			} else {
 				assert.Equal(t, tt.err, err)
 			}
