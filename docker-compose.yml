@@ -24,6 +24,7 @@ services:
       - src/.env
 
   vector_agent:
+    profiles: ["logging"]
     image: timberio/vector:0.45.0-alpine
     volumes:
       - ./vector/agent.yaml:/etc/vector/vector.yaml:ro
