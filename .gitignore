@@ -44,3 +44,6 @@ docs/superpowers/
 # whatsmeow store (legacy path)
 src/whatsapp/
 .mcp.json
+
+# Per-server compose override (example: docker-compose.override.example.yml)
+docker-compose.override.yml
