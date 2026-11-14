@@ -1,0 +1,15 @@
+# Per-server extras. Copy to docker-compose.override.yml (git-ignored; compose loads it by itself).
+# Simple values go in the root .env instead: GOWA_BIND_IP, GOWA_HOST_PORT (default 3000),
+# GOWA_STORAGES (named volume or ./storages bind path; default storages_data).
+# Example = badr (Postgres on the external network app_default, plus statics bind mount):
+services:
+  whatsapp_go:
+    environment:
+      PGSSLMODE: disable
+    networks: [default, pg]
+    volumes:
+      - ./statics:/app/statics
+networks:
+  pg:
+    external: true
+    name: app_default
