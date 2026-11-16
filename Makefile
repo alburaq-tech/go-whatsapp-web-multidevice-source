@@ -6,11 +6,14 @@ up:
 # Copies the WhatsApp session folder (mount of /app/storages) to <folder>.bak-<time>; read-only on the live session.
 # Source = mount of the running container, else ./storages. A failed copy stops gowa-up.
 backup-storages:
-	@src=$$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/storages"}}{{.Source}}{{end}}{{end}}' $$(docker compose ps -q whatsapp_go) 2>/dev/null); \
+	@cid=$$(docker compose ps -q whatsapp_go 2>/dev/null); \
+	src=$$(test -n "$$cid" && docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/storages"}}{{.Source}}{{end}}{{end}}' $$cid 2>/dev/null); \
 	src=$${src:-$(CURDIR)/storages}; \
 	test -d "$$src" || { echo "backup-storages: $$src not found, nothing to back up"; exit 0; }; \
 	dst="$$src.bak-$$(date +%Y%m%d-%H%M%S)"; \
-	cp -a "$$src" "$$dst" && echo "backup-storages: $$src -> $$dst ($$(du -sh $$dst | cut -f1))"
+	if test -n "$$cid"; then mkdir "$$dst" && docker cp "$$cid:/app/storages/." "$$dst" || exit 1; \
+	else cp -a "$$src" "$$dst" || exit 1; fi; \
+	echo "backup-storages: $$src -> $$dst ($$(du -sh $$dst | cut -f1))"
 # Safe recreate: back up the session first, then up.
 gowa-up: backup-storages up
 down:
